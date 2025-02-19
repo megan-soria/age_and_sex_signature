@@ -1,0 +1,350 @@
+---
+title: "Age and Sex signature analysis"
+author: "MSoria"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: yes
+    toc_float: true
+  html_notebook:
+    theme: lumen
+    toc_float: true
+    toc: yes
+---
+
+```{r load library, include=FALSE}
+# Load Libraries 
+# Installation of some useful packages
+suppressPackageStartupMessages({c(
+  library(tidyverse), 
+  library(DESeq2), 
+  library(dplyr), 
+  library(RColorBrewer), 
+  library(circlize),
+  library(ggplot2), 
+  library(ggrepel), 
+  library(PCAtools),
+  library(ggpubr),
+  library(viridis),
+  library(mitch),
+  library(msigdbr),
+  library(biomaRt),
+  library(gplots)
+  )})
+
+# Load custom functions 
+source("functions.R") 
+
+set.seed(42)
+```
+
+# Load and transform data
+Load counts and biological data
+```{r}
+cts <- readRDS("rds/cts.rds")
+
+pheno_data <- readRDS("rds/pheno_data.rds")
+
+# make sure colnames and rownames of the dataframes match
+all(rownames(pheno_data) == colnames(cts)) # should return TRUE
+```
+
+Load DE results and datasets
+```{r}
+deRes_youngVSold_male_cells <- readRDS("rds/deRes_youngVSold_male_cells.rds")
+deRes_youngVSold_male_tissue <- readRDS("rds/deRes_youngVSold_male_tissue.rds")
+
+# Get gene names from biomaRt; use mirrors if default does not work
+mart <- useMart(biomart = "ensembl", dataset = "hsapiens_gene_ensembl")
+               # host = "https://useast.ensembl.org/",
+               # host = "https://asia.ensembl.org/")
+
+biomart_transcript2gene <- getBM(attributes = c('ensembl_gene_id',
+                            'external_gene_name'), mart = mart)
+```
+
+# Supplementary Fig 5: Age signature (All)
+Create fold-changes matrices and plots
+```{r }
+cellFC_05 <- diff_expr2(deRes_youngVSold_male_cells[, -7], 0.05, 1)
+tissueFC_05 <- diff_expr2(deRes_youngVSold_male_tissue[, -7], 0.05, 1)
+
+cellFC <- cellFC_05 %>% 
+  rownames_to_column(var = "ensembl_gene") %>% 
+  dplyr::select(c(ensembl_gene, log2FoldChange, padj, diffexpressed)) 
+names(cellFC) <- c("ensembl_gene", "L2FC_Cell", "padj_Cell", "diff_Cell")
+
+tissueFC <- tissueFC_05 %>% 
+  rownames_to_column(var = "ensembl_gene") %>% 
+  dplyr::select(c(ensembl_gene, log2FoldChange, padj, diffexpressed)) 
+names(tissueFC) <- c("ensembl_gene", "L2FC_Tissue", "padj_Tissue", "diff_Tissue")
+
+FC_mat_all <- inner_join(cellFC, tissueFC) %>% 
+  mutate(Expression = ifelse(diff_Cell == "NO" & diff_Tissue == "NO", "NS",
+                    ifelse(diff_Cell == "NO" & diff_Tissue == "UP", "Tissue (+)",
+                    ifelse(diff_Cell == "NO" & diff_Tissue == "DOWN", "Tissue (-)",
+                    ifelse(diff_Cell == "UP" & diff_Tissue == "NO", "Cell (+)", 
+                    ifelse(diff_Cell == "UP" & diff_Tissue == "UP", "All (+)",
+                    ifelse(diff_Cell == "UP" & diff_Tissue == "DOWN", "Cell (+) : Tissue (-)", 
+                    ifelse(diff_Cell == "DOWN" & diff_Tissue == "NO", "Cell (-)", 
+                    ifelse(diff_Cell == "DOWN" & diff_Tissue == "UP", "Cell (-) : Tissue (+)",
+                    ifelse(diff_Cell == "DOWN" & diff_Tissue == "DOWN", "All (-)",
+                                  "NA")))))))))) 
+                           
+biomart_transcript2gene <- biomart_transcript2gene %>% 
+  rename("ensembl_gene_id" = "ensembl_gene") %>% unique()
+
+FC_mat_all <- left_join(FC_mat_all, biomart_transcript2gene)
+
+
+b <- ggplot(FC_mat_all, aes(x=L2FC_Cell, y=L2FC_Tissue, color=Expression))+ 
+                       #label=external_gene_name)) + 
+  geom_point(size = 4, alpha=0.8) + 
+  # ggrepel::geom_label_repel(data=subset(FC_mat_all, Expression == "All (+)" | 
+  #                         Expression == "All (-)"), force = 3, seed = 42,
+  #                         label.padding = 0.1, point.padding = 0.2, size = 2, color = "brown") +
+  labs(x = "Cell Log2FC", y = "Tissue Log2FC") +
+  scale_color_viridis(discrete=TRUE, option="turbo") +
+  theme_pubr() +
+  geom_hline(yintercept=0, linetype="dashed", color = "lightgrey") +
+  geom_vline(xintercept=0, linetype="dashed", color = "lightgrey")
+
+b
+```
+
+# Fig 5A: Age signature (Significant data points only)
+Padj < 0.05, log2FC > 1, < -1
+```{r}
+FC_mat_05 <- FC_mat_all %>% 
+  filter(Expression !="NS")
+
+c <- ggplot(FC_mat_05, aes(x=L2FC_Cell, y=L2FC_Tissue, color=Expression, 
+                       label=external_gene_name)) + 
+  geom_point(size = 4, alpha=0.8) + 
+  ggrepel::geom_label_repel(data=subset(FC_mat_all, Expression == "All (+)" |
+                          Expression == "All (-)"), force = 3, seed = 42,
+                          label.padding = 0.1, point.padding = 0.2, size = 2, color = "brown") +
+  labs(x = "Cell Log2FC", y = "Tissue Log2FC") +
+  scale_color_viridis(discrete=TRUE, option="turbo") +
+  theme_pubr() +
+  geom_hline(yintercept=0, linetype="dashed", color = "lightgrey") +
+  geom_vline(xintercept=0, linetype="dashed", color = "lightgrey")
+
+c
+```
+```{r eval=FALSE, include=FALSE}
+pdf("figures/ageSigx_cellVStissue_log2fc_padj05.pdf",
+    width = 9,
+    height = 5)
+b
+c
+dev.off()
+
+base_size = 15
+```
+
+# Supplementary Fig 5B: Sex Signature (All)
+Load DE results 
+```{r}
+deRes_maleVSfemale_young_cell <- readRDS("rds/deRes_maleVSfemale_young_cell.rds")
+deRes_maleVSfemale_young_tissue <- readRDS("rds/deRes_maleVSfemale_young_tissue.rds")
+```
+
+Create fold-changes matrices and plots
+```{r fig.height=5, fig.width=9}
+cellFC_05 <- diff_expr2(deRes_maleVSfemale_young_cell[, -7], 0.05, 1)
+tissueFC_05 <- diff_expr2(deRes_maleVSfemale_young_tissue[, -7], 0.05, 1)
+ 
+cellFC <- cellFC_05 %>% 
+  rownames_to_column(var = "ensembl_gene") %>% 
+  dplyr::select(c(ensembl_gene, log2FoldChange, padj, diffexpressed)) 
+names(cellFC) <- c("ensembl_gene", "L2FC_Cell", "padj_Cell", "diff_Cell")
+
+tissueFC <- tissueFC_05 %>% 
+  rownames_to_column(var = "ensembl_gene") %>% 
+  dplyr::select(c(ensembl_gene, log2FoldChange, padj, diffexpressed)) 
+names(tissueFC) <- c("ensembl_gene", "L2FC_Tissue", "padj_Tissue", "diff_Tissue")
+
+FC_mat_all <- inner_join(cellFC, tissueFC) %>% 
+  mutate(Expression = ifelse(diff_Cell == "NO" & diff_Tissue == "NO", "NS",
+                    ifelse(diff_Cell == "NO" & diff_Tissue == "UP", "Tissue (+)",
+                    ifelse(diff_Cell == "NO" & diff_Tissue == "DOWN", "Tissue (-)",
+                    ifelse(diff_Cell == "UP" & diff_Tissue == "NO", "Cell (+)", 
+                    ifelse(diff_Cell == "UP" & diff_Tissue == "UP", "All (+)",
+                    ifelse(diff_Cell == "UP" & diff_Tissue == "DOWN", "Cell (+) : Tissue (-)", 
+                    ifelse(diff_Cell == "DOWN" & diff_Tissue == "NO", "Cell (-)", 
+                    ifelse(diff_Cell == "DOWN" & diff_Tissue == "UP", "Cell (-) : Tissue (+)",
+                    ifelse(diff_Cell == "DOWN" & diff_Tissue == "DOWN", "All (-)",
+                                  "NA")))))))))) 
+
+FC_mat_all <- left_join(FC_mat_all, biomart_transcript2gene)
+
+
+a <- ggplot(FC_mat_all, aes(x=L2FC_Cell, y=L2FC_Tissue, color=Expression, 
+                       label=external_gene_name)) + 
+  geom_point(size = 4, alpha=0.8) + 
+  # ggrepel::geom_label_repel(data=subset(FC_mat_all, Expression == "All (+)" | 
+  #                         Expression == "All (-)"), force = 3, seed = 42,
+  #                         label.padding = 0.1, point.padding = 0.2, size = 4, color = "brown") +
+  labs(x = "Cell Log2FC", y = "Tissue Log2FC") +
+  scale_color_viridis(discrete=TRUE, option="turbo") + 
+  theme_pubr(base_size = 15) +
+  geom_hline(yintercept=0, linetype="dashed", color = "lightgrey") +
+  geom_vline(xintercept=0, linetype="dashed", color = "lightgrey")
+
+a
+```
+
+# Fig 6A: Sex Signature ((Significant data points only)
+Padj < 0.05, log2FC > 1, < -1
+```{r fig.height=5, fig.width=9}
+FC_mat_05 <- FC_mat_all %>% 
+  filter(Expression !="NS")
+
+b <- ggplot(FC_mat_05, aes(x=L2FC_Cell, y=L2FC_Tissue, color=Expression, 
+                       label=external_gene_name)) + 
+  geom_point(size = 4, alpha=0.8) + 
+  ggrepel::geom_label_repel(data=subset(FC_mat_all, Expression == "All (+)" | 
+                          Expression == "All (-)"), force = 3, seed = 42,
+                          label.padding = 0.1, point.padding = 0.2, size = 4, color = "brown") +
+  labs(x = "Cell Log2FC", y = "Tissue Log2FC") +
+  scale_color_viridis(discrete=TRUE, option="turbo") +
+  theme_pubr(base_size = 15) +
+  geom_hline(yintercept=0, linetype="dashed", color = "lightgrey") +
+  geom_vline(xintercept=0, linetype="dashed", color = "lightgrey")
+
+b
+```
+
+```{r eval=FALSE, include=FALSE}
+pdf("figures/seSigx_cellVStissue_log2fc_padj05.pdf",
+    width = 9,
+    height = 5)
+a
+b
+dev.off()
+
+```
+
+# Figure 5B and 5C: Sex Signature (mitch)
+```{r}
+
+reactome <- msigdbr(species = "Homo sapiens", 
+                 category = "C2", subcategory = "CP:REACTOME") %>% 
+  dplyr::distinct(gs_name, human_ensembl_gene) %>% 
+  mutate(gs_name = gsub("REACTOME_", "", gs_name)) %>% 
+  mutate(gs_name = gsub("_", " ", gs_name)) %>% 
+  group_by(gs_name) %>%
+  summarise(all.genes = list(unique(human_ensembl_gene))) %>%
+  deframe()
+
+  df1 <- deRes_youngVSold_male_cells[, -7] %>%
+    rownames_to_column(., var = "ensembl_gene_id") %>%
+    group_by(ensembl_gene_id) %>% 
+    dplyr::summarise(across(everything(), mean))
+  
+  df2 <- deRes_youngVSold_male_tissue[, -7] %>%
+    rownames_to_column(., var = "ensembl_gene_id") %>%
+    group_by(ensembl_gene_id) %>% 
+    dplyr::summarise(across(everything(), mean))
+  
+mitch_reslist <- list("Cell" = df1, "Tissue" = df2)
+
+y<-mitch_import(mitch_reslist,"DESeq2", geneIDcol="ensembl_gene_id")
+head(y)
+
+# prioritisation by effect
+res<-mitch_calc(y,reactome,priority="effect")
+mitch_report(res,"ageSignature.html")
+#mitch_plots(res,"ageSignature.pdf")
+
+```
+
+```{r fig.height=12, fig.width=9.5}
+d <- ncol(res$input_profile)
+resrows <- length(res$detailed_sets)
+
+hmapx <- head(res$enrichment_result[, 4:(4 + d - 1)], resrows)
+rownames(hmapx) <- head(res$enrichment_result$set, resrows)
+colnames(hmapx) <- gsub("^s.", "", colnames(hmapx))
+
+my_palette <- colorRampPalette(c("blue", "white", "red"))(n = 25)
+        
+heatmap.2(as.matrix(hmapx), scale = "none", margins = c(5, 35),
+                  dendrogram = "row", cexRow = 0.8, trace = "none", 
+          cexCol = 1.2, col = my_palette, key =F )
+```
+
+
+```{r fig.height=12, fig.width=9.5, include=FALSE}
+pdf("figures/ageSignature_mitch_hmap.pdf",
+    width = 9.5,
+    height = 12)
+
+heatmap.2(as.matrix(hmapx), scale = "none", margins = c(5, 35),
+                  dendrogram = "row", cexRow = 0.8, trace = "none", 
+          cexCol = 1.2, col = my_palette, key =F )
+dev.off()
+```
+
+
+# Figure 6B and 6C: Sex Signature (mitch)
+```{r}
+
+  df3 <- deRes_maleVSfemale_young_cell[, -7] %>%
+    rownames_to_column(., var = "ensembl_gene_id") %>%
+    group_by(ensembl_gene_id) %>% 
+    dplyr::summarise(across(everything(), mean))
+  
+  df4 <- deRes_maleVSfemale_young_tissue[, -7] %>%
+    rownames_to_column(., var = "ensembl_gene_id") %>%
+    group_by(ensembl_gene_id) %>% 
+    dplyr::summarise(across(everything(), mean))
+  
+mitch_reslist <- list("Cell" = df3, "Tissue" = df4)
+
+y<-mitch_import(mitch_reslist,"DESeq2", geneIDcol="ensembl_gene_id")
+head(y)
+
+# prioritisation by effect
+res_sex<-mitch_calc(y,reactome,priority="effect",cores=2)
+mitch_report(res_sex,"sexSignature.html")
+#mitch_plots(res_sex,"sexSignature.pdf")
+
+```
+
+
+```{r fig.height=12, fig.width=12}
+d <- ncol(res_sex$input_profile)
+resrows <- length(res_sex$detailed_sets)
+
+hmapx <- head(res_sex$enrichment_result[, 4:(4 + d - 1)], resrows)
+rownames(hmapx) <- head(res_sex$enrichment_result$set, resrows)
+colnames(hmapx) <- gsub("^s.", "", colnames(hmapx))
+
+my_palette <- colorRampPalette(c("blue", "white", "red"))(n = 25)
+        
+heatmap.2(as.matrix(hmapx), scale = "none", margins = c(5, 45),
+                  dendrogram = "row", cexRow = 0.8, trace = "none", 
+          cexCol = 1.2, col = my_palette, key =F )
+```
+
+
+```{r fig.height=12, fig.width=12}
+pdf("figures/sexSignature_mitch_hmap.pdf",
+    width = 12,
+    height = 12)
+
+heatmap.2(as.matrix(hmapx), scale = "none", margins = c(5, 45),
+                  dendrogram = "row", cexRow = 0.8, trace = "none", 
+          cexCol = 1.2, col = my_palette, key =F )
+dev.off()
+```
+
+
+
+
+
+```{r}
+sessionInfo()  
+```

@@ -1,0 +1,231 @@
+---
+title: 'Incorporating differentiation scores to Cell Study'
+author: "MSoria"
+date: "2024-01-18"
+output:
+  html_document:
+    toc: yes
+  html_notebook:
+    theme: lumen
+    toc: yes
+---
+
+Here, a differentiation "ruler" is built to be applied to the human cell and tissue data. The differentiation scores will be derived from the GSE168897 dataset.
+
+```{r load library, include=FALSE}
+# Load Libraries
+
+# Installation of some useful packages
+suppressPackageStartupMessages({c(
+  library(tidyverse),
+  library(DESeq2),
+  library(dplyr), 
+  library(msigdbr),
+  library(ggplot2)
+  )})
+
+set.seed(42)
+```
+
+# Load and transform data
+Load counts and biological data for cell differentiation
+```{r}
+
+url <- "https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE168897&format=file&file=GSE168897%5Fgenewise%2Dcount%2Ecsv%2Egz"
+destfile <- "data/GSE168897_genewise-count.csv.gz"
+
+# Download the file
+if(!file.exists(destfile))(download.file(url, destfile))
+
+# Read the gzipped CSV file
+cts <- read.csv(gzfile(destfile)) %>% 
+  column_to_rownames(var = "gene") %>% 
+  as.data.frame()
+
+pheno_data <- data.frame(ColName = names(cts)) %>% 
+  separate_wider_delim(ColName, delim = "_", 
+                       names = c("Cell_line", "TimePoint", "Replicate"),
+                       cols_remove = F) %>% 
+  mutate(ColName = paste0(Cell_line, "_", TimePoint)) %>% 
+  as.data.frame()
+rownames(pheno_data) <- names(cts)
+
+# Set factors
+pheno_data$TimePoint <- as.factor(pheno_data$TimePoint)
+pheno_data$ColName <- as.factor(pheno_data$ColName)
+
+# check rownames of sample data equal column names of count matrix
+all(rownames(pheno_data) == colnames(cts))
+
+# Create a deseq object with count and bio data. 
+dds0 <- DESeqDataSetFromMatrix(countData = cts, colData = pheno_data, design = ~ TimePoint)
+
+# Collapse R1 and R2 as replicates
+#ddsColl <- collapseReplicates(dds0, dds0$ColName, dds0$Replicate)
+ddsColl <- collapseReplicates(dds0, dds0$ColName, dds0$Replicate)
+
+# check that the sum of the counts for "sample1" is the same
+# as the counts in the "sample1" column in ddsColl
+matchFirstLevel <- dds0$ColName == levels(dds0$ColName)[1]
+all(rowSums(counts(dds0[,matchFirstLevel])) == counts(ddsColl[,1])) #Should return true
+
+cts_diff <- as.data.frame(counts(ddsColl))
+pheno_diff <- as.data.frame(ddsColl@colData)
+
+head(cts_diff)
+
+``` 
+
+Load counts data for cell samples
+```{r}
+cts <- readRDS("rds/cts.rds")
+
+pheno_data <- readRDS("rds/pheno_data.rds") %>% 
+  mutate(Phenotype = paste0(Sex, "-", Age)) 
+
+# make sure colnames and rownames of the dataframes match
+all(rownames(pheno_data) == colnames(cts)) # should return TRUE
+
+pheno_cells <- pheno_data %>% 
+  filter(Type == "Cells")
+
+cts_cells <- cts[,colnames(cts) %in% pheno_cells$RowName]
+
+head(cts_cells)
+```
+
+
+***
+# Supplementary Fig 4: Weighted sum using PCA for differentiation scale
+Calculate differentiation scale
+```{r fig.height=5, fig.width=8}
+dds <- DESeqDataSetFromMatrix(countData = cts_diff, colData = pheno_diff, design = ~ TimePoint)
+
+x <- dim(dds)
+
+keep <- rowMeans(counts(dds)) >= 10
+dds <- dds[keep,]
+
+dds <- DESeq(dds)
+vsd <- vst(dds, blind = T)
+normalized_counts <- as.matrix(assay(vsd))
+
+# Transpose the normalized count matrix (genes as columns, samples as rows) for PCA
+pca <- prcomp(t(normalized_counts), scale. = TRUE)
+
+plotPCA(vsd, intgroup="TimePoint")
+
+# Extract the loadings for the first principal component (PC1)
+pc1_loadings <- pca$rotation[, 1]
+
+normalized_counts <- normalized_counts[names(pc1_loadings), ]
+identical(names(pc1_loadings), rownames(normalized_counts))
+
+# Compute weighted sum using PC1 loadings as weights
+weighted_sum_pca <- apply(normalized_counts, 2, function(sample) {
+  sum(sample * pc1_loadings, na.rm = TRUE)
+})
+
+
+# Min-max scaling
+min_score <- min(weighted_sum_pca)
+max_score <- max(weighted_sum_pca)
+differentiation_score_pca <- (weighted_sum_pca - min_score) / (max_score - min_score)
+differentiation_score_DF <- as.data.frame(differentiation_score_pca) %>% 
+  rownames_to_column(var = "TimePoint") %>% 
+  mutate(TimePoint = gsub(".*_", "", .$TimePoint)) %>% 
+  group_by(TimePoint) %>% 
+  summarise_all(., mean)
+
+differentiation_score_DF
+
+write.csv(differentiation_score_DF, "~/RA/fourCoreGenotype/full_data/data/differentiation_score_DF.csv")
+
+a <- ggplot(differentiation_score_DF, aes(x = TimePoint, y = differentiation_score_pca)) +
+  geom_point(color = 'darkblue', size = 5 , alpha = 0.8) +
+  ggtitle('Differentiation Score Across Timepoints
+  via Weighted Sum (PCA 1)') +
+  theme_minimal(base_size = 15) +
+  labs(x = 'Timepoints', y = 'Differentiation Score') +
+  theme(plot.title = element_text(hjust = 0.5, size = 17))
+
+a
+```
+
+
+```{r}
+pdf("figures/differentiationScore_plot.pdf",
+    height = 5,
+    width = 8)
+
+a
+
+dev.off()
+
+```
+
+# Apply differentiation score to cell data
+```{r}
+all(rownames(pheno_cells) == colnames(cts_cells))
+dds_cells <- DESeqDataSetFromMatrix(countData = cts_cells, colData = pheno_cells, design = ~ Sex)
+
+x <- dim(dds_cells)
+
+keep <- rowMeans(counts(dds_cells)) >= 10
+dds_cells <- dds_cells[keep,]
+
+dds_cells <- DESeq(dds_cells)
+normalized_counts_cells <- as.matrix(assay(vst(dds_cells, blind = T)))
+
+# Extract gene names (rownames) from differentiation dataset
+new_data <- normalized_counts_cells[rownames(normalized_counts_cells) %in% names(pc1_loadings), ]
+
+pc1_loadings2 <- pc1_loadings[names(pc1_loadings) %in% rownames(new_data)]
+
+new_data <- new_data[names(pc1_loadings2), ]
+identical(names(pc1_loadings2), rownames(new_data))
+
+# Apply previous PC1 loadings as weights to the new normalized data
+cell_weighted_sum <- apply(new_data, 2, function(sample) {
+  sum(sample * pc1_loadings2, na.rm = TRUE)
+})
+
+# Min-max scaling
+min_score_new <- min(cell_weighted_sum)
+max_score_new <- max(cell_weighted_sum)
+cell_differentiation_score <- (cell_weighted_sum - min_score) / (max_score - min_score)
+
+# ensures that any scores below 0 are capped at 0 and any scores above 1 are capped at 1
+#cell_differentiation_score <- pmin(pmax(cell_differentiation_score, 0), 1)
+cell_differentiation_scoreDF <- as.data.frame(cell_differentiation_score)
+cell_differentiation_scoreDF
+
+write.csv(cell_differentiation_scoreDF, "data/cell_differentiation_scoreDF.csv")
+```
+
+# Table 2: Classify samples according to differentiation score
+```{r}
+scores <- differentiation_score_DF$differentiation_score_pca
+cell_classified_scoreDF2 <- cell_differentiation_scoreDF %>% 
+  rownames_to_column(var = "ID") %>% 
+  mutate(Diff_timePoint = case_when(
+    cell_differentiation_score <= scores[1] ~ "T1",
+    cell_differentiation_score > scores[1] & cell_differentiation_score <= scores[2] ~ "T2",
+    cell_differentiation_score > scores[2] & cell_differentiation_score <= scores[3] ~ "T3",
+    cell_differentiation_score > scores[3] & cell_differentiation_score <= scores[4] ~ "T4",
+    cell_differentiation_score > scores[4] & cell_differentiation_score <= scores[5] ~ "T5",
+    cell_differentiation_score > scores[5] & cell_differentiation_score <= 1.0 ~ "T6",
+    cell_differentiation_score > 1.0 ~ "T6_plus",
+    TRUE ~ NA_character_  # In case some values don't fit the thresholds
+  ))
+
+#saveRDS(cell_classified_scoreDF2, "rds/cell_classified_scoreDF2.rds")
+write.csv(cell_classified_scoreDF2, "data/cell_classified_scoreDF2.csv")
+```
+
+
+# Session information
+```{r}
+sessionInfo()   
+``` 
+

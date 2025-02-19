@@ -1,0 +1,903 @@
+---
+title: 'Differential expression analysis: age and sex profiles (muscle tissue vs cell)'
+author: "MSoria"
+date: "2024-01-18"
+output:
+  pdf_document:
+    toc: yes
+  html_notebook:
+    theme: lumen
+    toc: yes
+  html_document:
+    toc: yes
+---
+
+```{r load library, include=FALSE}
+# Load Libraries
+
+# Installation of some useful packages
+suppressPackageStartupMessages({c(
+  if(!isTRUE(require("prettydoc"))){install.packages("prettydoc")},
+  library(tidyverse), 
+  library(RNAseqQC),
+  #library(RUVSeq), 
+  library(DESeq2),
+  library(dplyr), 
+  library(tidyr), 
+  library(RColorBrewer), 
+  library(circlize),
+  library(ggplot2), 
+  library(ggrepel), 
+  library(PCAtools),
+  library(EnhancedVolcano), 
+  library(cowplot),
+  library(clusterProfiler),
+  library(org.Hs.eg.db),
+  library(stringr),
+  library(msigdbr)
+  )})
+
+# Load custom functions 
+source("functions.R") 
+
+# Set seed for reproducibility
+set.seed(42)
+```
+
+This RMD compares transcriptomic profiles of sex and age in human muscle cells versus tissue. Fastq files from this analysis is available at NCBI GEO (GSE287342).
+
+```{r}
+# run this first if running the project for the first time
+# create subdirectories for outputs: data, rds, and figures
+
+# filePath <- "~/age_and_sex_signature"
+# startProjDir(filePath)
+```
+
+
+# Load and transform data
+Load counts and biological data
+```{r}
+url <- "https://ftp.ncbi.nlm.nih.gov/geo/series/GSE287nnn/GSE287342/suppl/GSE287342%5Fraw%5Fcounts.csv.gz"
+destfile <- "data/cell_tissue_count.csv.gz"
+
+# Download the file
+if(!file.exists(destfile))(download.file(url, destfile))
+
+cts <- read.csv(gzfile(destfile)) %>% 
+  column_to_rownames(var = "X") %>% 
+  mutate_if(is.integer, as.double) %>% 
+  as.data.frame()
+
+colnames(cts) <- gsub("\\.", "-", colnames(cts))
+
+saveRDS(cts, "rds/cts.rds")
+
+sex <- c(rep("Male", each = 4), rep("Female", each = 2), rep("Male", each = 4),
+         rep("Female", each = 2), rep("Male", each = 6), rep("Female", each = 6), 
+         rep("Male", each = 2), rep("Female", each = 4), rep("Male", each = 2),
+         rep("Female", each = 2), rep("Male", each = 18), rep("Female", each = 4),
+         rep("Male", each = 4))
+sex <- as.factor(sex)
+
+age <- c(rep("Young", each = 8), rep("Old", each = 2), rep("Young", each = 2),
+         rep("Old", each = 2), rep("Young", each = 2), rep("Old", each = 2), 
+         rep("Young", each = 12), rep("Old", each = 2), rep("Young", each = 2),
+         rep("Old", each = 2), rep("Young", each = 2), rep("Old", each = 8),
+         rep("Young", each = 2), rep("Old", each = 2), rep("Young", each = 10))
+age <- as.factor(age)
+
+pheno_data <- data.frame(row.names = colnames(cts),
+                  "ID" = colnames(cts),
+                  "Type" = gsub(".*-", "", colnames(cts)),
+                  "Individual" = rep(1:30, each = 2),
+                  "RowName" = colnames(cts),
+                  "Sex" = sex,
+                  "Age" = age
+                  )
+pheno_data <- pheno_data %>% 
+  mutate(Phenotype = paste0(Sex, "-", Age)) 
+
+# set levels
+pheno_data$Individual <- factor(pheno_data$Individual, 
+                                 levels = unique(pheno_data$Individual))
+pheno_data$Sex <- factor(pheno_data$Sex, 
+                                 levels = unique(pheno_data$Sex))
+pheno_data$Age <- factor(pheno_data$Age, 
+                                 levels = unique(pheno_data$Age))
+pheno_data$Type <- factor(pheno_data$Type, 
+                                 levels = unique(pheno_data$Type))
+
+saveRDS(pheno_data, "rds/pheno_data.rds")
+
+# make sure colnames and rownames of the dataframes match
+all(rownames(pheno_data) == colnames(cts)) # should return TRUE
+```
+
+```{r}
+head(cts, 20) 
+head(pheno_data, 20)
+```
+
+
+-------
+
+# Maintenance of overall phenotype
+## Tissue vs Cells (All samples)
+How well is the *overall phenotype* conserved in tissue and cell muscle biopsy cultures?
+```{r echo=TRUE}
+countData <- cts
+dds <- DESeqDataSetFromMatrix(countData = countData, 
+                              colData = pheno_data, 
+                              design = ~ Individual + Type )
+```
+
+Here rows that have *at least 10 average* reads are kept for downstream analysis.
+```{r}
+x <- dim(dds)
+
+threshold <- 10
+# requiredColumns <- ceiling(0.8 * ncol(counts(dds)))
+# keep <- rowSums(counts(dds) >= requiredSum ) >= requiredColumns
+keep <- rowMeans(counts(dds)) >= threshold 
+dds <- dds[keep,]
+
+# normalisation
+vsd <- vst(dds, blind=T)
+
+cat("---- Table Dimensions ---- ", "\n",
+    "Before filtering for lowcounts: ", x, "\n",
+    "After filtering for lowcounts:  ", dim(dds))
+``` 
+
+### Fig 3A: Tissue vs Cell (All Samples) PCA Plot
+```{r fig.width=13, fig.height=6, message=FALSE, warning=FALSE}
+p <- plot_pca(vsd, PC_x = 1, PC_y = 2, color_by = "Phenotype", shape_by = "Type",
+         point_rel_size = 10, show_plot = F) 
+
+p$plot + scale_color_manual("Phenotype",values=c("darkred", "#56B4E9", "darkblue")) +
+  geom_hline(aes(yintercept = 0), linetype=2, color = "black") + 
+  geom_vline(aes(xintercept = 0), linetype=2, color = "black") +
+  ylim(-25, 25) +
+  labs(title = "Fig 3A: Tissue vs Cell (All Samples) PCA Plot") +
+  theme_minimal(base_size = 20) +
+  theme(panel.grid.minor = element_blank(),
+        plot.title = element_text(face = "bold", hjust = 0.5, size = 25))
+```
+
+```{r eval=FALSE, fig.height=5, fig.width=7, message=FALSE, warning=FALSE, include=FALSE}
+pdf("figures/pca_tissueVScellsAll.pdf",
+    height=6,
+    width=13)
+p$plot + scale_color_manual("Phenotype",values=c("darkred", "#56B4E9", "darkblue")) +
+  geom_hline(aes(yintercept = 0), linetype=2, color = "black") + 
+  geom_vline(aes(xintercept = 0), linetype=2, color = "black") +
+  ylim(-25, 25) +
+  labs(title = "Tissue vs Cell (All Samples) PCA Plot") +
+  theme_minimal(base_size = 20) +
+  theme(panel.grid.minor = element_blank(),
+        plot.title = element_text(face = "bold", hjust = 0.5, size = 25))
+dev.off()
+```
+
+Creating DE object
+```{r echo=T, message=FALSE, warning=FALSE}
+dds <- DESeq(dds)
+deseq_result <-results(dds) 
+
+# Separating results according to comparison/contrast for analysis
+ddsContrast_list <- list("Tissue_vs_Cell" = as.data.frame(
+                              results(dds, contrast = c("Type", "Tissue", "Cells"))))
+
+deRes_tissueVScells <- diff_expressed(ddsContrast_list, 0.05, 1) 
+
+top <- deRes_tissueVScells[[1]] %>% 
+  filter(diffexpressed != "NO") %>% 
+  arrange(desc(log2FoldChange)) 
+
+top30_DE <- rbind(head(top, n = 15),
+                  tail(top, n = 15)) 
+
+head(top30_DE, 30)
+# saveRDS(deRes_tissueVScells[[1]], "rds/deRes_tissueVScells.rds")
+```
+
+### Fig 3B: Volcano Plots
+```{r fig.height=5, fig.width=7, message=FALSE, warning=FALSE}
+DE_Results_list <- deRes_tissueVScells
+plots <- list()
+
+for (i in 1:length(DE_Results_list)) {
+    upGenes <- table(DE_Results_list[[i]]$diffexpressed)["UP"]
+    downGenes <- table(DE_Results_list[[i]]$diffexpressed)["DOWN"]
+    name <- gsub("_", " ", names(DE_Results_list[i]))
+    
+    p <- EnhancedVolcano(DE_Results_list[[i]], 
+                         x="log2FoldChange", y="padj", 
+                         lab = NA, pCutoff = 0.05, 
+                         FCcutoff = 1, title = name, 
+                         subtitle = paste0("Up-regulated = ", 
+                                           upGenes, " and Down-regulated = ", 
+                                           downGenes), 
+                         gridlines.major = FALSE, 
+                         gridlines.minor = FALSE, 
+                         axisLabSize = 14, titleLabSize = 14, 
+                         subtitleLabSize = 11.5,captionLabSize = 0, 
+                         legendLabSize = 10, legendIconSize = 5, 
+                         col = c("grey30", "royalblue", "forestgreen", "red2"))
+  
+  plots[[i]] <- p
+}
+
+plots
+```
+
+
+```{r fig.height=5, fig.width=7, message=FALSE, warning=FALSE}
+pdf("figures/deRes_tissueVScellsAll.pdf",
+    height=5,
+    width=7)
+plots
+dev.off()
+```
+
+
+
+GSEA: Get reactome pathways
+```{r}
+# for clusterProfiler fGSEA
+reactome <- msigdbr(species = "Homo sapiens", 
+                 category = "C2", subcategory = "CP:REACTOME") %>% 
+  dplyr::distinct(gs_name, human_ensembl_gene) %>% 
+  mutate(gs_name = gsub("REACTOME_", "", gs_name)) %>% 
+  mutate(gs_name = gsub("_", " ", gs_name)) 
+
+# for GSEA
+reactome_list <- reactome %>% 
+  group_by(gs_name) %>%
+  summarise(all.genes = list(unique(human_ensembl_gene))) %>%
+  deframe()
+
+```
+
+Create input gene list
+```{r message=FALSE, warning=FALSE, fig.height=9, fig.width=10}
+original_gene_list <- DE_Results_list[[1]]$log2FoldChange
+names(original_gene_list) <- rownames(DE_Results_list[[1]])
+gene_list<-na.omit(original_gene_list)
+gene_list = sort(gene_list, decreasing = TRUE)
+  
+condition_name <- gsub("_", " ", names(DE_Results_list[1]))
+
+```
+
+### Fig 3C: Enriched Reactome Pathways
+Run enrichment function
+```{r fig.height=10, fig.width=10}
+options(enrichment_force_universe = TRUE)
+
+p_clusterProfilr <- clusterProfiler::GSEA(
+  geneList = gene_list,
+  minGSSize = 10,
+  maxGSSize = 500,
+  pvalueCutoff = 0.05,
+  pAdjustMethod = "BH",
+  TERM2GENE = reactome,
+  verbose = TRUE,
+  seed = 42,
+  by = "fgsea")
+
+p <- enrichplot::dotplot(p_clusterProfilr,
+        x = "GeneRatio",
+        color = "p.adjust",
+        showCategory = 15,
+        size = NULL,
+        split = ".sign",
+        font.size = 11,
+        title = "Enriched reactome pathways",
+        orderBy = "NES",
+        label_format = 40, 
+        ) + 
+  facet_grid(~.sign) +
+ # scale_y_discrete()
+  scale_y_discrete(labels = function(x) str_wrap(x, width = 50)) +
+  theme(panel.spacing = unit(0.5, "cm", data = NULL)) +
+  #labs(subtitle = "Enriched reactome pathways") +
+  theme(plot.title=element_text(hjust=0.5, size = 20))
+          #plot.subtitle=element_text(hjust=0.5, size = 10))
+
+p
+```
+
+
+```{r fig.height=9, fig.width=9, include=FALSE}
+pdf("figures/fgsea_tissueVScellsAll.pdf",
+    height=10,
+    width=10)
+p
+dev.off()
+```
+
+
+### Supplementary Fig 1C: GSEA with NES
+```{r fig.height=9, fig.width=10, include=FALSE}
+res_fgsea <- GSEA(gene_list, reactome_list, 0.05, condition_name)
+
+p <- res_fgsea$Plot2 +
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 50)) +
+  theme_linedraw()+
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        plot.title = element_text(size = 20, face = "bold", hjust=0.5),
+        plot.subtitle = element_text(size = 14, hjust=0.5),
+        axis.text.y = element_text(size = 9),
+        axis.title.x = element_text(size = 13, face = "italic"),
+        axis.title.y = element_text(size = 18, face = "italic"))
+p
+```
+
+
+```{r fig.height=9, fig.width=10, include=FALSE}
+pdf("figures/fgsea_tissueVScellsAll_NES.pdf",
+    height=9,
+    width=10)
+p
+dev.off()
+```
+
+# Sex Phenotype for each type (tissue or cell)
+## Male vs Female (Tissues)
+Here, we try to establish the sex phenotype in young tissue samples. 
+```{r echo=TRUE}
+coldata <- pheno_data %>% 
+  filter(Type == "Tissue") %>% 
+  filter(Age == "Young")
+# set levels
+coldata$Sex <- factor(coldata$Sex, 
+                                 levels = unique(coldata$Sex))
+
+countData <- cts[, colnames(cts) %in% coldata$RowName]
+# make sure colnames and rownames of the dataframes match
+all(rownames(coldata) == colnames(countData)) # should return TRUE
+
+dds <- DESeqDataSetFromMatrix(countData = countData, 
+                              colData = coldata, 
+                              design = ~ Sex )
+```
+Here rows that have *at least 10 average* reads are kept for downstream analysis.
+```{r}
+x <- dim(dds)
+
+threshold <- 10
+# requiredColumns <- ceiling(0.8 * ncol(counts(dds)))
+# keep <- rowSums(counts(dds) >= requiredSum ) >= requiredColumns
+keep <- rowMeans(counts(dds)) >= threshold 
+dds <- dds[keep,]
+
+# normalisation
+vsd <- vst(dds, blind=T)
+
+cat("---- Table Dimensions ---- ", "\n",
+    "Before filtering for lowcounts: ", x, "\n",
+    "After filtering for lowcounts:  ", dim(dds))
+``` 
+
+Creating DE object
+```{r echo=T, message=FALSE, warning=FALSE}
+dds <- DESeq(dds)
+deseq_result <-results(dds)
+
+# saveRDS(dds, "rds/Male_vs_Female_young_tissue.rds")
+
+# Separating results according to comparison/contrast for analysis
+ddsContrast_list <- list("Male_vs_Female_young_tissue" = as.data.frame(
+                              results(dds, contrast = c("Sex", "Male", "Female"))))
+
+deRes_maleVSfemale_young_tissue <- diff_expressed(ddsContrast_list, 0.05, 1)
+
+top <- deRes_maleVSfemale_young_tissue[[1]] %>% 
+  filter(diffexpressed != "NO") %>% 
+  arrange(desc(log2FoldChange)) 
+
+top30_DE <- rbind(head(top, n = 15),
+                  tail(top, n = 15)) 
+
+head(top30_DE, 30)
+
+saveRDS(deRes_maleVSfemale_young_tissue[[1]], "rds/deRes_maleVSfemale_young_tissue.rds")
+```
+
+### Fig 1A: Male vs Female Young Tissue (Volcano Plot)
+```{r fig.height=5, fig.width=7, message=FALSE, warning=FALSE}
+DE_Results_list <- deRes_maleVSfemale_young_tissue
+plots <- list()
+
+for (i in 1:length(DE_Results_list)) {
+    upGenes <- table(DE_Results_list[[i]]$diffexpressed)["UP"]
+    downGenes <- table(DE_Results_list[[i]]$diffexpressed)["DOWN"]
+    name <- gsub("_", " ", names(DE_Results_list[i]))
+    
+    p <- EnhancedVolcano(DE_Results_list[[i]], 
+                         x="log2FoldChange", y="padj", 
+                         lab = NA, pCutoff = 0.05, 
+                         FCcutoff = 1, title = name, 
+                         subtitle = paste0("Up-regulated = ", 
+                                           upGenes, " and Down-regulated = ", 
+                                           downGenes), 
+                         gridlines.major = FALSE, 
+                         gridlines.minor = FALSE, 
+                         axisLabSize = 14, titleLabSize = 14, 
+                         subtitleLabSize = 11.5,captionLabSize = 0, 
+                         legendLabSize = 10, legendIconSize = 5, 
+                         col = c("grey30", "royalblue", "forestgreen", "red2"))
+  
+  plots[[i]] <- p
+}
+
+plots
+
+```
+
+
+```{r fig.height=5, fig.width=7, message=FALSE, warning=FALSE, include=FALSE}
+pdf("figures/deRes_maleVSfemale_young_tissue.pdf",
+    height=5,
+    width=7)
+plots
+dev.off()
+```
+
+GSEA: create input gene list
+```{r message=FALSE, warning=FALSE, fig.height=9, fig.width=10}
+original_gene_list <- DE_Results_list[[1]]$log2FoldChange
+names(original_gene_list) <- rownames(DE_Results_list[[1]])
+gene_list<-na.omit(original_gene_list)
+gene_list = sort(gene_list, decreasing = TRUE)
+  
+condition_name <- gsub("_", " ", names(DE_Results_list[1]))
+```
+
+### Fig 1B: Enriched Reactome Pathways
+Run enrichment function
+```{r fig.height=6, fig.width=9}
+options(enrichment_force_universe = TRUE)
+
+p_clusterProfilr <- clusterProfiler::GSEA(
+  geneList = gene_list,
+  minGSSize = 10,
+  maxGSSize = 500,
+  pvalueCutoff = 0.05,
+  pAdjustMethod = "BH",
+  TERM2GENE = reactome,
+  verbose = TRUE,
+  seed = 42,
+  by = "fgsea")
+
+p <- enrichplot::dotplot(p_clusterProfilr,
+        x = "GeneRatio",
+        color = "p.adjust",
+        showCategory = 15,
+        size = NULL,
+        split = ".sign",
+        font.size = 8,
+        title = condition_name,
+        orderBy = "NES",
+        label_format = 40, 
+        ) + 
+  facet_grid(~.sign) +
+  theme(panel.spacing = unit(0.5, "cm", data = NULL)) +
+  labs(subtitle = "Enriched reactome pathways") +
+  theme(plot.title=element_text(hjust=0.5, size = 15),
+          plot.subtitle=element_text(hjust=0.5, size = 10))
+
+p
+```
+
+```{r fig.height=5, fig.width=7, message=FALSE, warning=FALSE, include=FALSE}
+pdf("figures/fgsea_maleVSfemale_young_tissue.pdf",
+    height=6,
+    width=9)
+p
+dev.off()
+```
+
+### Supplementary Fig 1A: GSEA with NES
+```{r eval=FALSE, fig.height=9, fig.width=10, message=FALSE, warning=FALSE, include=FALSE}
+res_fgsea <- GSEA(gene_list, reactome_list, 0.05, condition_name)
+
+p <- res_fgsea$Plot2 +
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 50)) +
+  theme_linedraw()+
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        plot.title = element_text(size = 20, face = "bold", hjust=0.5),
+        plot.subtitle = element_text(size = 14, hjust=0.5),
+        axis.text.y = element_text(size = 9),
+        axis.title.x = element_text(size = 13, face = "italic"),
+        axis.title.y = element_text(size = 18, face = "italic"))
+p
+```
+
+## Male vs Female (Cells)
+Here, we try to establish the sex phenotype in young tissue samples. 
+```{r echo=TRUE}
+coldata <- pheno_data %>% 
+  filter(Type == "Cells") %>% 
+  filter(Age == "Young")
+# set levels
+coldata$Sex <- factor(coldata$Sex, 
+                                 levels = unique(coldata$Sex))
+
+countData <- cts[, colnames(cts) %in% coldata$RowName]
+# make sure colnames and rownames of the dataframes match
+all(rownames(coldata) == colnames(countData)) # should return TRUE
+
+dds <- DESeqDataSetFromMatrix(countData = countData, 
+                              colData = coldata, 
+                              design = ~ Sex )
+```
+Here rows that have *at least 10 average* reads are kept for downstream analysis.
+```{r}
+x <- dim(dds)
+
+threshold <- 10
+# requiredColumns <- ceiling(0.8 * ncol(counts(dds)))
+# keep <- rowSums(counts(dds) >= requiredSum ) >= requiredColumns
+keep <- rowMeans(counts(dds)) >= threshold 
+dds <- dds[keep,]
+
+# normalisation
+vsd <- vst(dds, blind=T)
+
+cat("---- Table Dimensions ---- ", "\n",
+    "Before filtering for lowcounts: ", x, "\n",
+    "After filtering for lowcounts:  ", dim(dds))
+``` 
+
+Creating DE object
+```{r echo=T, message=FALSE, warning=FALSE}
+dds <- DESeq(dds)
+deseq_result <-results(dds)
+
+# saveRDS(dds, "rds/Male_vs_Female_young_cell.rds")
+
+# Separating results according to comparison/contrast for analysis
+ddsContrast_list <- list("Male_vs_Female_young_cell" = as.data.frame(
+                              results(dds, contrast = c("Sex", "Male", "Female"))))
+
+deRes_maleVSfemale_young_cell <- diff_expressed(ddsContrast_list, 0.05, 1)
+
+top <- deRes_maleVSfemale_young_cell[[1]] %>% 
+  filter(diffexpressed != "NO") %>% 
+  arrange(desc(log2FoldChange)) 
+
+top30_DE <- rbind(head(top, n = 15),
+                  tail(top, n = 15)) 
+
+head(top30_DE, 30)
+
+saveRDS(deRes_maleVSfemale_young_cell[[1]], "rds/deRes_maleVSfemale_young_cell.rds")
+
+```
+
+### Fig 2A: Male vs Female Young Cell (Volcano Plot)
+```{r fig.height=5, fig.width=7, message=FALSE, warning=FALSE}
+DE_Results_list <- deRes_maleVSfemale_young_cell
+plots <- list()
+
+for (i in 1:length(DE_Results_list)) {
+    upGenes <- table(DE_Results_list[[i]]$diffexpressed)["UP"]
+    downGenes <- table(DE_Results_list[[i]]$diffexpressed)["DOWN"]
+    name <- gsub("_", " ", names(DE_Results_list[i]))
+    
+    p <- EnhancedVolcano(DE_Results_list[[i]], 
+                         x="log2FoldChange", y="padj", 
+                         lab = NA, pCutoff = 0.05, 
+                         FCcutoff = 1, title = name, 
+                         subtitle = paste0("Up-regulated = ", 
+                                           upGenes, " and Down-regulated = ", 
+                                           downGenes), 
+                         gridlines.major = FALSE, 
+                         gridlines.minor = FALSE, 
+                         axisLabSize = 14, titleLabSize = 14, 
+                         subtitleLabSize = 11.5,captionLabSize = 0, 
+                         legendLabSize = 10, legendIconSize = 5, 
+                         col = c("grey30", "royalblue", "forestgreen", "red2"))
+  
+  plots[[i]] <- p
+}
+plots
+
+```
+
+
+```{r fig.height=5, fig.width=7, message=FALSE, warning=FALSE, include=FALSE}
+pdf("figures/deRes_maleVSfemale_young_cell.pdf",
+    height=5,
+    width=7)
+plots
+dev.off()
+```
+
+
+# Age Phenotype
+## Young vs Old (Tissue)
+Here, we try to establish the age phenotype in male tissue samples. 
+```{r echo=TRUE}
+coldata <- pheno_data %>% 
+  filter(Type == "Tissue") %>% 
+  filter(Sex == "Male")
+# set levels
+coldata$Age <- factor(coldata$Age, 
+                                 levels = unique(coldata$Age))
+
+countData <- cts[, colnames(cts) %in% coldata$RowName]
+# make sure colnames and rownames of the dataframes match
+all(rownames(coldata) == colnames(countData)) # should return TRUE
+
+dds <- DESeqDataSetFromMatrix(countData = countData, 
+                              colData = coldata, 
+                              design = ~ Age )
+```
+Here rows that have *at least 10 average* reads are kept for downstream analysis.
+```{r}
+x <- dim(dds)
+
+threshold <- 10
+# requiredColumns <- ceiling(0.8 * ncol(counts(dds)))
+# keep <- rowSums(counts(dds) >= requiredSum ) >= requiredColumns
+keep <- rowMeans(counts(dds)) >= threshold 
+dds <- dds[keep,]
+
+# normalisation
+vsd <- vst(dds, blind=T)
+
+cat("---- Table Dimensions ---- ", "\n",
+    "Before filtering for lowcounts: ", x, "\n",
+    "After filtering for lowcounts:  ", dim(dds))
+``` 
+
+Creating DE object
+```{r echo=T, message=FALSE, warning=FALSE}
+dds <- DESeq(dds)
+deseq_result <-results(dds)
+
+# saveRDS(dds, "rds/Young_vs_Old_male_tissue.rds")
+
+# Separating results according to comparison/contrast for analysis
+ddsContrast_list <- list("Young_vs_Old_male_tissue" = as.data.frame(
+                              results(dds, contrast = c("Age", "Young", "Old"))))
+
+deRes_youngVSold_male_tissue <- diff_expressed(ddsContrast_list, 0.05, 1)
+
+top <- deRes_youngVSold_male_tissue[[1]] %>% 
+  filter(diffexpressed != "NO") %>% 
+  arrange(desc(log2FoldChange)) 
+
+top30_DE <- rbind(head(top, n = 15),
+                  tail(top, n = 15)) 
+
+head(top30_DE, 30)
+
+saveRDS(deRes_youngVSold_male_tissue[[1]], "rds/deRes_youngVSold_male_tissue.rds")
+
+```
+### Fig 1C: Young vs Old Male Tissue (Volcano Plot)
+```{r fig.height=5, fig.width=7, message=FALSE, warning=FALSE}
+DE_Results_list <- deRes_youngVSold_male_tissue
+plots <- list()
+
+for (i in 1:length(DE_Results_list)) {
+    upGenes <- table(DE_Results_list[[i]]$diffexpressed)["UP"]
+    downGenes <- table(DE_Results_list[[i]]$diffexpressed)["DOWN"]
+    name <- gsub("_", " ", names(DE_Results_list[i]))
+    
+    p <- EnhancedVolcano(DE_Results_list[[i]], 
+                         x="log2FoldChange", y="padj", 
+                         lab = NA, pCutoff = 0.05, 
+                         FCcutoff = 1, title = name, 
+                         subtitle = paste0("Up-regulated = ", 
+                                           upGenes, " and Down-regulated = ", 
+                                           downGenes), 
+                         gridlines.major = FALSE, 
+                         gridlines.minor = FALSE, 
+                         axisLabSize = 14, titleLabSize = 14, 
+                         subtitleLabSize = 11.5,captionLabSize = 0, 
+                         legendLabSize = 10, legendIconSize = 5, 
+                         col = c("grey30", "royalblue", "forestgreen", "red2"))
+  
+  plots[[i]] <- p
+}
+
+plots
+```
+
+
+```{r fig.height=5, fig.width=7, message=FALSE, warning=FALSE, include=FALSE}
+pdf("figures/deRes_youngVSold_male_tissue.pdf",
+    height=5,
+    width=7)
+plots
+dev.off()
+```
+
+GSEA: Create input gene list
+```{r message=FALSE, warning=FALSE, fig.height=9, fig.width=10}
+original_gene_list <- DE_Results_list[[1]]$log2FoldChange
+names(original_gene_list) <- rownames(DE_Results_list[[1]])
+gene_list<-na.omit(original_gene_list)
+gene_list = sort(gene_list, decreasing = TRUE)
+  
+condition_name <- gsub("_", " ", names(DE_Results_list[1]))
+```
+
+### Fig 1D: Enriched Reactome Pathways
+Run enrichment function
+```{r fig.height=6, fig.width=9}
+options(enrichment_force_universe = TRUE)
+
+p_clusterProfilr <- clusterProfiler::GSEA(
+  geneList = gene_list,
+  minGSSize = 10,
+  maxGSSize = 500,
+  pvalueCutoff = 0.05,
+  pAdjustMethod = "BH",
+  TERM2GENE = reactome,
+  verbose = TRUE,
+  seed = 42,
+  by = "fgsea")
+
+p <- enrichplot::dotplot(p_clusterProfilr,
+        x = "GeneRatio",
+        color = "p.adjust",
+        showCategory = 15,
+        size = NULL,
+        split = ".sign",
+        font.size = 8,
+        title = condition_name,
+        orderBy = "NES",
+        label_format = 40, 
+        ) + 
+  facet_grid(~.sign) +
+  theme(panel.spacing = unit(0.5, "cm", data = NULL)) +
+  labs(subtitle = "Enriched reactome pathways") +
+  theme(plot.title=element_text(hjust=0.5, size = 15),
+          plot.subtitle=element_text(hjust=0.5, size = 10))
+
+p
+```
+
+
+```{r fig.height=5, fig.width=7, message=FALSE, warning=FALSE, include=FALSE}
+pdf("figures/fgsea_youngVSold_male_tissue.pdf",
+    height=6,
+    width=9)
+p
+dev.off()
+```
+
+### Supplementary Fig 1B: GSEA with NES
+```{r eval=FALSE, fig.height=9, fig.width=10, message=FALSE, warning=FALSE, include=FALSE}
+res_fgsea <- GSEA(gene_list, reactome_list, 0.05, condition_name)
+
+p <- res_fgsea$Plot2 +
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 50)) +
+  theme_linedraw()+
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        plot.title = element_text(size = 20, face = "bold", hjust=0.5),
+        plot.subtitle = element_text(size = 14, hjust=0.5),
+        axis.text.y = element_text(size = 9),
+        axis.title.x = element_text(size = 13, face = "italic"),
+        axis.title.y = element_text(size = 18, face = "italic"))
+p
+```
+
+
+## Young vs Old (Cells)
+Here, we try to establish the age phenotype in male tissue samples. 
+```{r echo=TRUE}
+coldata <- pheno_data %>% 
+  filter(Type == "Cells") %>% 
+  filter(Sex == "Male")
+# set levels
+coldata$Age <- factor(coldata$Age, 
+                                 levels = unique(coldata$Age))
+
+countData <- cts[, colnames(cts) %in% coldata$RowName]
+# make sure colnames and rownames of the dataframes match
+all(rownames(coldata) == colnames(countData)) # should return TRUE
+
+dds <- DESeqDataSetFromMatrix(countData = countData, 
+                              colData = coldata, 
+                              design = ~ Age )
+```
+
+Here rows that have *at least 10 average* reads are kept for downstream analysis.
+```{r}
+x <- dim(dds)
+
+threshold <- 10
+# requiredColumns <- ceiling(0.8 * ncol(counts(dds)))
+# keep <- rowSums(counts(dds) >= requiredSum ) >= requiredColumns
+keep <- rowMeans(counts(dds)) >= threshold 
+dds <- dds[keep,]
+
+# normalisation
+vsd <- vst(dds, blind=T)
+
+cat("---- Table Dimensions ---- ", "\n",
+    "Before filtering for lowcounts: ", x, "\n",
+    "After filtering for lowcounts:  ", dim(dds))
+``` 
+
+Creating DE object
+```{r echo=T, message=FALSE, warning=FALSE}
+dds <- DESeq(dds)
+deseq_result <-results(dds)
+
+# saveRDS(dds, "rds/Young_vs_Old_male_cells.rds")
+
+# Separating results according to comparison/contrast for analysis
+ddsContrast_list <- list("Young_vs_Old_male_cells" = as.data.frame(
+                              results(dds, contrast = c("Age", "Young", "Old"))))
+
+deRes_youngVSold_male_cells <- diff_expressed(ddsContrast_list, 0.05, 1)
+
+top <- deRes_youngVSold_male_cells[[1]] %>% 
+  filter(diffexpressed != "NO") %>% 
+  arrange(desc(log2FoldChange)) 
+
+top30_DE <- rbind(head(top, n = 15),
+                  tail(top, n = 15)) 
+
+head(top30_DE, 30)
+
+saveRDS(deRes_youngVSold_male_cells[[1]], "rds/deRes_youngVSold_male_cells.rds")
+
+```
+
+### Fig 2B: Young vs Old Male Cells (Volcano Plot)
+```{r fig.height=5, fig.width=7, message=FALSE, warning=FALSE}
+DE_Results_list <- deRes_youngVSold_male_cells
+plots <- list()
+
+for (i in 1:length(DE_Results_list)) {
+    upGenes <- table(DE_Results_list[[i]]$diffexpressed)["UP"]
+    downGenes <- table(DE_Results_list[[i]]$diffexpressed)["DOWN"]
+    name <- gsub("_", " ", names(DE_Results_list[i]))
+    
+    p <- EnhancedVolcano(DE_Results_list[[i]], 
+                         x="log2FoldChange", y="padj", 
+                         lab = NA, pCutoff = 0.05, 
+                         FCcutoff = 1, title = name, 
+                         subtitle = paste0("Up-regulated = ", 
+                                           upGenes, " and Down-regulated = ", 
+                                           downGenes), 
+                         gridlines.major = FALSE, 
+                         gridlines.minor = FALSE, 
+                         axisLabSize = 14, titleLabSize = 14, 
+                         subtitleLabSize = 11.5,captionLabSize = 0, 
+                         legendLabSize = 10, legendIconSize = 5, 
+                         col = c("grey30", "royalblue", "forestgreen", "red2"))
+  
+  plots[[i]] <- p
+}
+
+plots
+```
+
+
+```{r fig.height=5, fig.width=7, message=FALSE, warning=FALSE, include=FALSE}
+pdf("figures/deRes_youngVSold_male_cells.pdf",
+    height=5,
+    width=7)
+plots
+dev.off()
+```
+
+# Session information
+```{r}
+sessionInfo()   
+``` 
+

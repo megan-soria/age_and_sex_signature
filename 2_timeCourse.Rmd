@@ -1,0 +1,666 @@
+---
+title: "Time-course Analysis of GSE168897 Geo data"
+author: "MSoria"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: yes
+  html_notebook:
+    theme: lumen
+    toc: yes
+---
+
+# Load Libraries and custom functions
+```{r load library, include=FALSE}
+# Installation of some useful packages
+suppressPackageStartupMessages({c(
+  library(prettydoc), # html template
+  library(DESeq2), 
+  library(tidyverse), 
+  library(ggpubr),
+  library(ggplot2), 
+  library(ggrepel), 
+  library(cowplot), 
+  library(DEGreport),
+  library(clusterProfiler), 
+  library(enrichplot),
+  require(DOSE),
+  library(msigdbr),
+  library(RNAseqQC)
+  )})
+
+# Load custom functions 
+source("functions.R") 
+
+set.seed(42)
+```
+
+# Data preparation and reformatting
+## Load data
+Load the transcript counts, the sample data, and the transcript to gene ID conversion table.
+```{r}
+
+url <- "https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE168897&format=file&file=GSE168897%5Fgenewise%2Dcount%2Ecsv%2Egz"
+destfile <- "data/GSE168897_genewise-count.csv.gz"
+
+# Download the file
+if(!file.exists(destfile))(download.file(url, destfile))
+
+cts <- read.csv(gzfile(destfile)) %>% 
+  column_to_rownames(var = "gene") %>% 
+  as.data.frame()
+y <- length(rownames(cts))
+
+pheno_data <- data.frame(ColName = names(cts)) %>% 
+  separate_wider_delim(ColName, delim = "_", 
+                       names = c("Cell_line", "TimePoint", "Replicate"),
+                       cols_remove = F) %>% 
+  mutate(ColName = paste0(Cell_line, "_", TimePoint)) %>% 
+  as.data.frame()
+rownames(pheno_data) <- names(cts)
+# Set factors
+pheno_data$TimePoint <- as.factor(pheno_data$TimePoint)
+pheno_data$ColName <- as.factor(pheno_data$ColName)
+
+# check rownames of sample data equal column names of count matrix
+all(rownames(pheno_data) == colnames(cts))
+
+head(cts)
+head(pheno_data)
+```
+
+## Creating DESeq object 
+Create a deseq object with count and bio data. The reference or "control" is set to Male samples.
+
+```{r echo = T, results = 'hide'}
+dds0 <- DESeqDataSetFromMatrix(countData = cts, colData = pheno_data, design = ~ TimePoint)
+
+# Collapse R1 and R2 as replicates
+ddsColl <- collapseReplicates(dds0, dds0$ColName, dds0$Replicate)
+
+# check that the sum of the counts for "sample1" is the same
+# as the counts in the "sample1" column in ddsColl
+matchFirstLevel <- dds0$ColName == levels(dds0$ColName)[1]
+all(rowSums(counts(dds0[,matchFirstLevel])) == counts(ddsColl[,1])) #Should return true
+
+cts_collapsed <- as.data.frame(counts(ddsColl))
+pheno_collapsed <- as.data.frame(ddsColl@colData)
+
+#saveRDS(cts_collapsed, "rds/ctsGSE_collapsed.rds")
+#saveRDS(pheno_collapsed, "rds/phenoGSE_collapsed.rds")
+
+```
+
+## Filter low reads and normalisation
+Filter low reads by requiring more than 5 reads in at least two samples for each gene.
+Changed the filter threshold here (from mean = 10 for each row) because genes like foxl3 below is filtered out (ave = 5.8) even though it shows high counts in male (115) samples.
+
+```{r}
+dds <- ddsColl
+
+x <- dim(dds)
+
+keep <- rowMeans(counts(dds)) >= 10
+dds <- dds[keep,]
+
+dds <- estimateSizeFactors(dds)
+
+# normalisation
+vsd <- vst(dds, blind=T)
+
+cat("---- Table Dimensions ---- ", "\n",
+    "Before filtering for lowcounts: ", x, "\n",
+    "After filtering for lowcounts:  ", dim(dds))
+``` 
+
+# Check for sample outliers
+There are no obvious outliers detected from the dendrogram. 
+```{r}
+# detect outlier samples - hierarchical clustering
+htree <- hclust(dist(t(assay(vsd))), method = "average")
+groups <- cutree(htree, k=6) # cut tree into clusters
+
+plot(htree, labels(groups))
+# draw dendogram with red borders around the clusters
+rect.hclust(htree, k=6, border="red")
+```
+
+
+
+# PCA plots
+The PCA plot shows clear separation of T1, T2, T3, and T4 to T6 with PC1 and PC2 explaining 84% of the variance.
+```{r }
+plotPCA(vsd, intgroup="TimePoint")
+
+```
+
+Extracting results 
+Results are extracted with a pairwise comparison/contrast
+```{r echo = T, results = 'hide'}
+dds <- DESeq(dds)
+
+T1_vs_T2 <- as.data.frame(results(dds, contrast = c("TimePoint", "T1", "T2")))
+T2_vs_T3 <- as.data.frame(results(dds, contrast = c("TimePoint", "T2", "T3")))
+T3_vs_T4 <- as.data.frame(results(dds, contrast = c("TimePoint", "T3", "T4")))
+T4_vs_T5 <- as.data.frame(results(dds, contrast = c("TimePoint", "T4", "T5")))
+T5_vs_T6 <- as.data.frame(results(dds, contrast = c("TimePoint", "T5", "T6")))
+
+ddsContrast_list <- list("T1_vs_T2"=T1_vs_T2, 
+                         "T2_vs_T3"=T2_vs_T3, 
+                         "T3_vs_T4"=T3_vs_T4, 
+                         "T4_vs_T5"=T4_vs_T5, 
+                         "T5_vs_T6"=T5_vs_T6)
+
+```
+
+This function creates a column where genes are tagged as "YES" if up regulated (p adjusted value < 0.05 and  logfold2 change > 1) and "DOWN" if down regulated (p adjusted value < 0.05 and  logfold2 change < -1). The gene is tagged "NO" if it does not fit any of the criteria. 
+```{r echo = T, results = 'hide'}
+deResults_list <- diff_expressed(ddsContrast_list, 0.05, 1)
+#saveRDS(deResults_list, "rds/timeCourse_deResults_list.rds")
+```
+
+
+Summary of up-regulated and down-regulated genes
+```{r fig.height=5, fig.width=6, warning=FALSE}
+diffexpr_summary <- list()
+
+for (i in 1:5) {
+  notSig <- table(deResults_list[[i]]$diffexpressed)["NO"]
+  upGenes <- table(deResults_list[[i]]$diffexpressed)["UP"]
+  downGenes <- table(deResults_list[[i]]$diffexpressed)["DOWN"]*-1
+  name <- gsub("_", " ", names(deResults_list[i])) 
+  name2 <- gsub("[Stage]", "", name)
+  
+  diffexpr_summary[[paste0(name)]]$Stage <- name2
+  diffexpr_summary[[paste0(name)]]$Count <- upGenes
+  diffexpr_summary[[paste0(name)]]$Expression <- "Up"
+
+  diffexpr_summary[[paste0(name, "Down")]]$Stage <- name2
+  diffexpr_summary[[paste0(name, "Down")]]$Count <- downGenes
+  diffexpr_summary[[paste0(name, "Down")]]$Expression <- "Down"
+  
+  diffexpr_summary[[paste0(name, "NS")]]$Stage <- name2
+  diffexpr_summary[[paste0(name, "NS")]]$Count <- notSig
+  diffexpr_summary[[paste0(name, "NS")]]$Expression <- "NotSignificant"
+}
+
+diffexpr_summaryDF <- do.call(rbind.data.frame, diffexpr_summary) %>%
+  group_by(Stage) %>% as.data.frame(.)
+
+diffexpr_summaryDF2 <- diffexpr_summaryDF %>% 
+  tidyr::pivot_wider(names_from = Expression, values_from = Count) %>% 
+  mutate(Down = Down*-1) %>% 
+  mutate(TotalDiffExp = Up + Down) %>% 
+  mutate(TotalCounts = Up + Down + NotSignificant) %>% 
+  mutate(PerCentSignif = round(TotalDiffExp / TotalCounts, digits = 4)*100)
+
+diffexpr_summaryDF2
+
+lvl <- c(unique(diffexpr_summaryDF$Stage)) 
+
+geneLevel1 <- ggplot(diffexpr_summaryDF[diffexpr_summaryDF$Expression != "NotSignificant",], 
+                    aes(x=factor(Stage, level= lvl)
+                               , y=Count, fill=Expression)) + 
+  geom_bar(stat="identity", position="identity", alpha=0.90) +
+  scale_fill_manual(values=c('Up' = "darkblue", 'Down' = "darkred"),
+                    breaks = c("Up", "Down")) +
+  #scale_fill_discrete(breaks=c('Up',"Down")) +
+  geom_text(aes(label = abs(Count), vjust = ifelse(Count >= 0, -0.2, 1.2)),
+            size = 3, colour = "#48494b") + 
+  theme_classic() +
+  ggtitle("Expressed gene levels for each time-point") +
+  labs(subtitle = "") +
+  ylab("Gene count") + xlab("Stage") +
+  theme(axis.text.x = element_text(angle = 0, size = 8, vjust = 0.5,
+                                   colour = "#48494b"),
+        axis.title = element_text(size = 12, colour = "#48494b"),
+        axis.line = element_line(colour = "grey"),
+        
+        plot.title = element_text(face = "bold", size = 15, hjust = 0.5),
+          panel.grid = element_blank()) 
+
+geneLevel1
+```
+
+# Fig 4A: Expressed gene levels for T2 to T6
+```{r fig.height=5, fig.width=5.5, warning=FALSE}
+diffexpr_summaryDF3 <- diffexpr_summaryDF %>% 
+filter(Stage != "T1 vs T2")
+
+lvl <- c(unique(diffexpr_summaryDF3$Stage)) 
+
+geneLevel2 <- ggplot(diffexpr_summaryDF3[diffexpr_summaryDF3$Expression != "NotSignificant",], 
+                    aes(x=factor(Stage, level= lvl)
+                               , y=Count, fill=Expression)) + 
+  geom_bar(stat="identity", position="identity", alpha=0.90) +
+  scale_fill_manual(values=c('Up' = "darkblue", 'Down' = "darkred"),
+                    breaks = c("Up", "Down")) +
+  #scale_fill_discrete(breaks=c('Up',"Down")) +
+  geom_text(aes(label = abs(Count), vjust = ifelse(Count >= 0, -0.2, 1.2)),
+            size = 3, colour = "#48494b") + 
+  theme_classic() +
+  ggtitle("Expressed gene levels for T2 to T6") +
+  labs(subtitle = "") +
+  ylab("Gene count") + xlab("Stage") +
+  theme(axis.text.x = element_text(angle = 0, size = 8, vjust = 0.5,
+                                   colour = "#48494b"),
+        axis.title = element_text(size = 12, colour = "#48494b"),
+        axis.line = element_line(colour = "grey"),
+        
+        plot.title = element_text(face = "bold", size = 15, hjust = 0.5),
+          panel.grid = element_blank()) 
+
+geneLevel2
+```
+
+
+```{r fig.height=5, fig.width=5.5, warning=FALSE}
+pdf("figures/DElevels_timecourse.pdf",
+    width = 5.5,
+    height = 5)
+geneLevel2
+dev.off()
+```
+
+Plot CLusters for all time points and Remove T1 data
+```{r}
+coldata <- pheno_data
+
+#For fitering
+remove(dds)
+coldata <- pheno_data %>%
+  filter(TimePoint != "T1")
+
+
+# set levels
+coldata$TimePoint <- factor(coldata$TimePoint, 
+                                 levels = unique(coldata$TimePoint))
+coldata$ColName <- factor(coldata$ColName, 
+                                 levels = unique(coldata$ColName))
+
+countData <- cts[, colnames(cts) %in% rownames(coldata)]
+# make sure colnames and rownames of the dataframes match
+all(rownames(coldata) == colnames(countData)) # should return TRUE
+
+dds <- DESeqDataSetFromMatrix(countData = countData, colData = coldata, design = ~ TimePoint)
+
+# Collapse R1 and R2 as replicates
+ddsColl_ <- collapseReplicates(dds, dds$ColName, dds$Replicate)
+
+#x <- dim(ddsColl_t2t6)
+x <- dim(ddsColl_)
+
+keep <- rowMeans(counts(ddsColl_)) >= 10
+ddsColl_ <- ddsColl_[keep,]
+
+dds_t2t6 <- DESeq(ddsColl_)
+``` 
+
+
+# Fig 4B: Time series or LRT test
+Analyze all levels of a factor at once using [likelihood ratio test (LRT)](https://hbctraining.github.io/DGE_workshop/lessons/08_DGE_LRT.html) which is used to identify any genes that show change in expression across the different levels.
+
+```{r fig.height=10, fig.width=13}
+remove(dds)
+
+dds <- dds_t2t6
+T2_vs_T3 <- as.data.frame(results(dds, contrast = c("TimePoint", "T2", "T3")))
+T3_vs_T4 <- as.data.frame(results(dds, contrast = c("TimePoint", "T3", "T4")))
+T4_vs_T5 <- as.data.frame(results(dds, contrast = c("TimePoint", "T4", "T5")))
+T5_vs_T6 <- as.data.frame(results(dds, contrast = c("TimePoint", "T5", "T6")))
+
+dds_t2t6_Contrast_list <- list("T2_vs_T3"=T2_vs_T3, 
+                         "T3_vs_T4"=T3_vs_T4, 
+                         "T4_vs_T5"=T4_vs_T5, 
+                         "T5_vs_T6"=T5_vs_T6)
+
+coldataLRT <- as.data.frame(ddsColl_@colData)
+
+dds_lrt <- DESeq(dds, test="LRT", reduced=~1) 
+res_lrt <- results(dds_lrt)
+
+sig_res_LRT <- res_lrt %>%
+               data.frame() %>%
+               tibble::rownames_to_column(var="gene") %>% 
+               as_tibble() %>% 
+               filter(padj < 0.05) 
+ 
+# Get significant gene lists
+sigLRT_genes <- sig_res_LRT %>% 
+  arrange(padj) %>% 
+  pull(gene) 
+                
+n <- length(sigLRT_genes)
+
+rld <- rlog(dds, blind=TRUE)
+rld_mat <- assay(rld) %>% 
+  as.matrix()
+
+all(rownames(coldataLRT) == colnames(rld_mat))
+
+# Subset results for faster cluster finding (for classroom demo purposes)
+clustering_sig_genes <- sig_res_LRT %>%
+                  arrange(padj) %>%
+                  head(n=n)
+
+# Obtain rlog values for those significant genes
+cluster_rlog <- rld_mat[clustering_sig_genes$gene, ]
+
+# this function runs for a long time depending on n
+clusters <- degPatterns(cluster_rlog, metadata = coldataLRT, time = "TimePoint", col=NULL)
+
+#clusters <- readRDS("rds/clusters_all.rds")
+
+level_order <- c("T2", "T3", "T4", "T5", "T6")
+
+# Plot all clusters  
+timeSeries <- degPlotCluster(clusters$normalized, time = "TimePoint", lines = F) + 
+  scale_x_discrete(limits = level_order) +
+  scale_color_manual(values = "#2e008b") +
+ # facet_wrap(~factor(clusters$plot$data$title,
+ #                   levels = as.list(unique(clusters$plot$data$title))),
+ #          ncol = 2) +
+  theme_linedraw(base_size = 16) +
+    labs(title = "All Gene clusters exhibiting particular patterns across stages",
+         subtitle = "") + 
+    theme(plot.title=element_text(hjust=0.5, size = 18),
+          plot.subtitle=element_text(hjust=0.5),
+          panel.grid.major = element_line(colour = "lightgrey"), 
+          panel.grid.minor = element_line(colour = "lightgrey"),
+          legend.position = "none")
+
+timeSeries
+
+```
+
+Filter genes from Geo Study data DE analysis
+```{r fig.width=13, message=FALSE, warning=FALSE}
+list2 <- deResults_list$T2_vs_T3 %>% 
+  filter(diffexpressed != "NO") %>% 
+  rownames(.) 
+
+list3 <- deResults_list$T3_vs_T4 %>% 
+  filter(diffexpressed != "NO") %>% 
+  rownames(.) 
+
+list4 <- deResults_list$T4_vs_T5 %>% 
+  filter(diffexpressed != "NO") %>% 
+  rownames(.) 
+
+list5 <- deResults_list$T5_vs_T6 %>% 
+  filter(diffexpressed != "NO") %>% 
+  rownames(.) 
+
+ensembl_listDE <- unique(c(list2, list3, list4, list5))
+
+
+# number of unique DE genes from T2 to T6
+length(ensembl_listDE)
+```
+
+# Fig 4C: Tissue vs Cell (-DE Differentiation Genes)
+```{r fig.width=13, message=FALSE, warning=FALSE}
+countData <- readRDS("rds/cts.rds")
+pheno_data <- readRDS("rds/pheno_data.rds")
+
+countData_filtered <- countData %>% 
+  rownames_to_column(var = "ensembl_gene_id") %>% 
+  filter(!ensembl_gene_id %in% ensembl_listDE) %>% 
+  column_to_rownames(var = "ensembl_gene_id")
+
+
+dds <- DESeqDataSetFromMatrix(countData = countData_filtered, 
+                              colData = pheno_data, 
+                              design = ~ Individual + Type )
+
+threshold <- 10
+# requiredColumns <- ceiling(0.8 * ncol(counts(dds)))
+# keep <- rowSums(counts(dds) >= requiredSum ) >= requiredColumns
+keep <- rowMeans(counts(dds)) >= threshold 
+dds <- dds[keep,]
+
+y <- dim(dds)
+
+# normalisation
+vsd <- vst(dds, blind=T)
+
+p4 <- plot_pca(vsd, PC_x = 1, PC_y = 2, color_by = "Phenotype", shape_by = "Type",
+         point_rel_size = 10, show_plot = F) 
+
+p4$plot + scale_color_manual("Phenotype",values=c("darkred", "#56B4E9", "darkblue")) +
+  geom_hline(aes(yintercept = 0), linetype=2, color = "black") + 
+  geom_vline(aes(xintercept = 0), linetype=2, color = "black") +
+  ylim(-25, 25) +
+  labs(title = "Fig 4C: Tissue vs Cell (-DE Differentiation Genes)") +
+  theme_minimal(base_size = 20) +
+  theme(panel.grid.minor = element_blank(),
+        plot.title = element_text(face = "bold", hjust = 0.5, size = 25))
+```
+
+# Fig 4D: Tissue vs Cell (- 1411 random genes)
+Check if effect is similar for random gene list
+```{r fig.width=13, message=FALSE, warning=FALSE}
+n <- length(ensembl_listDE)
+max <- x[1]
+idx <- round(runif(n, min = 1, max = max))
+
+random_gene <- unique(rownames(countData))[idx]
+
+countData_random <- countData %>% 
+  rownames_to_column(var = "ensembl_gene_id") %>% 
+  filter(!ensembl_gene_id %in% random_gene) %>% 
+  column_to_rownames(var = "ensembl_gene_id")
+
+
+dds <- DESeqDataSetFromMatrix(countData = countData_random, 
+                              colData = pheno_data, 
+                              design = ~ Individual + Type )
+
+threshold <- 10
+# requiredColumns <- ceiling(0.8 * ncol(counts(dds)))
+# keep <- rowSums(counts(dds) >= requiredSum ) >= requiredColumns
+keep <- rowMeans(counts(dds)) >= threshold 
+dds <- dds[keep,]
+
+y <- dim(dds)
+
+# normalisation
+vsd <- vst(dds, blind=T)
+
+p5 <- plot_pca(vsd, PC_x = 1, PC_y = 2, color_by = "Phenotype", shape_by = "Type",
+         point_rel_size = 10, show_plot = F) 
+
+p5$plot + scale_color_manual("Phenotype",values=c("darkred", "#56B4E9", "darkblue")) +
+  geom_hline(aes(yintercept = 0), linetype=2, color = "black") + 
+  geom_vline(aes(xintercept = 0), linetype=2, color = "black") +
+  ylim(-25, 25) +
+  labs(title = "Fig 4D: Tissue vs Cell (- 1411 random genes)") +
+  theme_minimal(base_size = 20) +
+  theme(panel.grid.minor = element_blank(),
+        plot.title = element_text(face = "bold", hjust = 0.5, size = 25))
+```
+
+# Supplementary Fig 3: 20 iterations of random genes
+Repeat 20x with different seeds to make sure the spread is consistent
+```{r fig.width=13, fig.height=6, message=FALSE, warning=FALSE}
+randomFigs <- list()
+
+seeds <- c(1:20)
+
+for (i in seeds) {
+  
+set.seed(i)
+idx <- round(runif(n, min = 1, max = max))
+
+random_gene <- unique(rownames(countData))[idx]
+
+countData_random <- countData %>% 
+  rownames_to_column(var = "ensembl_gene_id") %>% 
+  filter(!ensembl_gene_id %in% random_gene) %>% 
+  column_to_rownames(var = "ensembl_gene_id")
+
+
+dds <- DESeqDataSetFromMatrix(countData = countData_random, 
+                              colData = pheno_data, 
+                              design = ~ Individual + Type )
+
+threshold <- 10
+# requiredColumns <- ceiling(0.8 * ncol(counts(dds)))
+# keep <- rowSums(counts(dds) >= requiredSum ) >= requiredColumns
+keep <- rowMeans(counts(dds)) >= threshold 
+dds <- dds[keep,]
+
+y <- dim(dds)
+
+# normalisation
+vsd <- vst(dds, blind=T)
+
+p5.1 <- plot_pca(vsd, PC_x = 1, PC_y = 2, color_by = "Phenotype", shape_by = "Type",
+         point_rel_size = 10, show_plot = F) 
+
+c <- p5.1$plot + scale_color_manual("Phenotype", values=c("darkred", "#56B4E9", "darkblue")) +
+  geom_hline(aes(yintercept = 0), linetype=2, color = "black") + 
+  geom_vline(aes(xintercept = 0), linetype=2, color = "black") +
+  ylim(-25, 25) +
+  labs(title = "Tissue vs Cell (All Samples)",
+       subtitle = paste0("Random Genes Filtered (T2 to T6 DE Genes)", " Iteration ", i)) +
+  theme_minimal(base_size = 20) +
+  theme(panel.grid.minor = element_blank(),
+        plot.title = element_text(face = "bold", hjust = 0.5, size = 25),
+        plot.subtitle = element_text(hjust = 0.5))
+
+randomFigs[[i]] <- c
+
+print(c)
+}
+```
+
+# Supplementarty Fig 2: ORA of Reactome terms per cluster
+
+**NOTE:** ORA is performed using clusterProfiler. "Universe" is set to all genes from the filtered counts matrix. Minimum gene set = 5 and max is set to 2000 to accommodate the large clusters. padjusted values for ORA is calculated using the BH method with the threshold set to < 0.05 and q-value from clusterProfiler is set to 0.2 (unchanged from the original function). 
+
+Some clusters did not pass the threshold values for ORA so they are excluded from the plots.
+```{r fig.height=10, fig.width=8.5, message=FALSE, warning=FALSE}
+reactome <- msigdbr(species = "Homo sapiens", 
+                 category = "C2", subcategory = "CP:REACTOME") %>% 
+  dplyr::distinct(gs_name, human_ensembl_gene) %>% 
+  mutate(gs_name = gsub("REACTOME_", "", gs_name)) %>% 
+  mutate(gs_name = gsub("_", " ", gs_name)) 
+
+universe <- deResults_list %>% 
+  .[[1]] %>% rownames(.)
+
+
+cl_num <- c(unique(clusters$df$cluster))
+
+enriched_plots <- list()
+enriched_lrt <- list()
+
+for (i in cl_num) {
+  C1_names <- clusters$df %>% 
+  filter(cluster == i) %>% 
+  pull(genes)
+
+options(enrichment_force_universe = TRUE)
+
+#print(i)
+
+C1_Enrich <- enricher(gene = C1_names,
+                      pvalueCutoff = 0.05,
+                      pAdjustMethod = "BH",
+                      universe = universe,
+                      minGSSize = 5,
+                      maxGSSize = 2000,
+                      qvalueCutoff = 0.2,
+                      gson = NULL,
+                      TERM2GENE = reactome,
+                      TERM2NAME = NA)
+
+if (!is.null(C1_Enrich)) {
+  C1_Enrich_plot <- barplot(C1_Enrich, showCategory = 20) +
+  labs(title = paste0("Cluster ", i, " (pvalue < 0.05)")) +
+  theme_cowplot() +
+  theme(plot.title=element_text(hjust=0.5),
+          plot.subtitle=element_text(hjust=0.5),
+          axis.title.y = element_text(size=15, face="italic"),
+          panel.grid.minor = element_blank())
+  
+      if (nrow(C1_Enrich_plot$data) > 0) {
+        enriched_lrt[[paste0("barPlot_cluster_", i)]] <- C1_Enrich
+      enriched_plots[[paste0("barPlot_cluster_", i)]] <- C1_Enrich_plot
+      } else {
+        enriched_lrt[[paste0("barPlot_cluster_", i)]] <- C1_Enrich
+      }
+  
+} else {
+  enriched_lrt[[paste0("barPlot_cluster_", i)]] <- C1_Enrich
+}
+
+}
+
+```
+
+```{r fig.height=20, fig.width=20, message=FALSE, warning=FALSE}
+plot_grid(plotlist = enriched_plots[1:4], ncol = 2, nrow = 2)
+```
+```{r fig.height=20, fig.width=20, message=FALSE, warning=FALSE}
+plot_grid(plotlist = enriched_plots[5:8], ncol = 2)
+```
+```{r fig.height=20, fig.width=20, message=FALSE, warning=FALSE}
+plot_grid(plotlist = enriched_plots[9:12], ncol = 2)
+```
+```{r fig.height=20, fig.width=20, message=FALSE, warning=FALSE}
+plot_grid(plotlist = enriched_plots[13:16], ncol = 2)
+```
+
+
+```{r fig.height=10, fig.width=10, include=FALSE}
+pdf(file = "figures/enriched_plots_t2t6.pdf",   
+    width =8.5, # The width of the plot in inches
+    height = 10) # The height of the plot in inches
+
+enriched_plots 
+
+dev.off()
+
+pdf(file = "figures/DESeq_timeSeries_t2t6.pdf",   
+    width =13, # The width of the plot in inches
+    height =10) # The height of the plot in inches
+
+timeSeries 
+
+dev.off()
+```
+
+
+```{r eval=FALSE, fig.height=5, fig.width=6, include=FALSE}
+# Plot clusters individually
+num <- c(unique(clusters$df$cluster))
+percluster_plots <- list()
+
+for (i in num) {
+  group <- clusters$normalized %>% 
+  filter(cluster == i)
+
+p <- degPlotCluster(group, time = "TimePoint", lines = T) + 
+  scale_x_discrete(limits = level_order) +
+  scale_color_manual(values = "#2e008b") +
+  theme_linedraw(base_size = 16) +
+    theme(axis.title.y = element_text(size = 13),
+      panel.grid.major = element_line(colour = "lightgrey"), 
+          panel.grid.minor = element_line(colour = "lightgrey"),
+          legend.position = "none")
+
+  percluster_plots[[paste0("cluster_", i)]] <- p
+}
+ 
+percluster_plots
+
+```
+
+  # Session Information
+
+```{r Session Info, echo=FALSE}
+sessionInfo()
+```
+ 
