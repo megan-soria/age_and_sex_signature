@@ -342,7 +342,8 @@ dev.off()
 ```
 
 
-
+# Supplementary Figure 6
+These figures are insides the generated mitch reports
 
 
 ```{r}
